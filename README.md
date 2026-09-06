@@ -1,174 +1,143 @@
-# SoC Estimation of a Li-ion NMC (LG) Cell using an Extended Kalman Filter
+# Throttle and Drive Safety System
 
-Software-in-the-Loop (SIL) implementation of an **Extended Kalman Filter (EKF)** that estimates the State of Charge (SoC) of a lithium-ion NMC cell under **dynamic load**, validated against a Batemo high-fidelity battery plant model.
+**Formula SAE Electric Vehicle — Anargya ITS EV Team**
 
----
-
-## 1. Why an EKF? (The Core Idea)
-
-Every practical SoC method fails on its own:
-
-| Method | Principle | Weakness |
-|---|---|---|
-| **OCV look-up** | Map rest voltage → SoC via the OCV–SoC curve | Only valid after a long rest; useless while current flows |
-| **Coulomb counting (CC)** | Integrate current over time | Open-loop. Drifts forever, because sensor bias and the unknown initial SoC are never corrected |
-| **EKF (this work)** | Fuse a battery **model** (prediction) with a **voltage measurement** (correction) | Needs a decent model and honest noise covariances |
-
-The EKF is not "a better formula". It is an **arbiter**: at every time step it decides *how much to trust the model versus the measurement*, through the Kalman gain. Coulomb counting supplies the prediction; terminal-voltage feedback through the OCV–SoC relation supplies the correction. That is the whole project in one sentence.
-
-**TL;DR** — Build a 2nd-order Thevenin (2-RC) equivalent circuit model of the cell, extract its parameters as functions of SoC from HPPC tests, discretise the model with Zero-Order Hold, linearise the output equation (`dVoc/dSoC`), and run an EKF in Simulink against a Batemo plant. Accuracy is reported as RMSE on a randomised current profile.
+Firmware and custom PCB implementing the accelerator pedal plausibility check and Ready-To-Drive logic for an FSAE electric race car. This repository documents the design reasoning and the two field-diagnosed failures that drove the redesign.
 
 ---
 
-## 2. Method Overview
+## 1. What This System Does
 
-The work was carried out in three stages:
+The accelerator pedal carries **two independent position sensors (APPS)**. Under normal operation they move together. If one sensor drifts, disconnects, or is damaged, the two readings diverge — and a divergent pedal signal on a high-torque electric drivetrain is a safety hazard.
 
-1. **Model study** — derive the state-space representation of the cell and identify what the EKF actually needs from it.
-2. **Parameter extraction** — run HPPC (Hybrid Pulse Power Characterisation) tests, fit the ECM parameters, and build the OCV–SoC curve.
-3. **Performance test** — run the SIL loop and evaluate against the plant model.
+This board continuously compares the two sensor signals. When the deviation exceeds the allowed threshold, it raises a fault and cuts torque delivery. It also handles the **Ready-To-Drive** sequence, which prevents the vehicle from becoming drivable without a deliberate driver action.
 
----
-
-## 3. Battery Plant and State-Space Model
-
-The cell is represented by a **2-RC Thevenin equivalent circuit model (ECM)**. States are the SoC and the two RC-branch voltages:
-
-$$x = \begin{bmatrix} SoC \\ V_1 \\ V_2 \end{bmatrix}$$
-
-Discretised with **Zero-Order Hold** over a sampling period $\Delta t$:
-
-$$
-\begin{bmatrix} SoC_{k+1} \\ V_{1,k+1} \\ V_{2,k+1} \end{bmatrix}
-=
-\begin{bmatrix}
-1 & 0 & 0 \\
-0 & e^{-\Delta t / \tau_1} & 0 \\
-0 & 0 & e^{-\Delta t / \tau_2}
-\end{bmatrix}
-\begin{bmatrix} SoC_k \\ V_{1,k} \\ V_{2,k} \end{bmatrix}
-+
-\begin{bmatrix}
--\dfrac{\eta \Delta t}{C_n} \\
-R_1\left(1 - e^{-\Delta t / \tau_1}\right) \\
-R_2\left(1 - e^{-\Delta t / \tau_2}\right)
-\end{bmatrix} I_k
-$$
-
-with $\tau_i = R_i C_i$. The measurement (output) equation is:
-
-$$V_{t,k} = OCV(SoC_k) - V_{1,k} - V_{2,k} - R_0 I_k$$
-
-Because $OCV(SoC)$ is **non-linear**, the output matrix must be linearised at each step — this is precisely what makes the filter *extended* rather than plain linear Kalman:
-
-$$C_k = \frac{\partial V_t}{\partial x}\bigg|_{x = \hat{x}_k} = \begin{bmatrix} \dfrac{\partial OCV}{\partial SoC}\bigg|_{\hat{SoC}_k} & -1 & -1 \end{bmatrix}$$
-
-> The state-space formulation and the EKF tuning strategy follow Farhad et al., *Scientific Reports* (2024) — see references.
-
-📷 *State-space and EKF equations:* `docs/state_space_equations.png`
+Redundant pedal sensing with an implausibility check is mandated by the FSAE ruleset precisely because a single-sensor failure on an electric powertrain can produce unintended acceleration.
 
 ---
 
-## 4. HPPC Parameter Extraction
+## 2. Problem 1 — Fault Triggering During Wheel Rotation
 
-**HPPC (Hybrid Pulse Power Characterisation)** applies discharge/charge current pulses at fixed SoC break-points and observes the voltage response. The response is then decomposed:
+### Symptom
 
-- The **instantaneous** voltage jump at pulse onset → $R_0$ (ohmic resistance)
-- The **exponential relaxation** afterwards → $R_1, C_1$ (fast, charge-transfer) and $R_2, C_2$ (slow, diffusion)
+The previous generation board produced **frequent spurious faults** whenever the tractive system was energised and the wheels were turning. The pedal was mechanically fine; the faults were false positives.
 
-ECM parameters are genuinely functions of **both SoC and temperature**. In principle the HPPC campaign must therefore be repeated across a temperature grid.
+### Diagnosis
 
-> ⚠️ **Scope limitation of this project:** only the **SoC dependence** was characterised. Temperature was held constant, so the parameter set is *not* valid outside the tested thermal condition. Extending the look-up tables to a 2-D (SoC, T) grid is the most obvious next step.
+The pedal sensor signals were wired **directly** into the motor controller's analogue input while simultaneously being read by the microcontroller. With the inverter switching and the motor running, noise coupled back along this shared node. The microcontroller interpreted that noise as a genuine deviation between the two sensor channels and tripped the implausibility fault.
 
-Parameters were fitted by comparing the analytical pulse-response curve against the measured HPPC response and selecting the parameter set that minimised the mismatch. The extraction procedure and the fitting equations follow Tran et al., *Batteries* (2021).
+The root cause was therefore neither the sensors nor the firmware threshold — it was **electrical coupling on a shared, unbuffered signal node**.
 
-📷 *HPPC current/voltage profile:* `docs/hppc_profile.png`
-📷 *Extracted parameters vs. SoC:* `docs/ecm_parameters.png`
+### Measurement
 
----
+Oscilloscope capture of the pedal signal at the motor controller input:
 
-## 5. OCV–SoC Characterisation
+| Quantity | Value |
+|---|---|
+| Measured noise | **1.88 V peak-to-peak** |
+| ADC reference | 3.3 V |
+| ADC resolution | 12-bit (4096 counts) |
 
-The EKF needs not only $OCV(SoC)$ for the output equation but also its **derivative** $\partial OCV / \partial SoC$ for the linearised $C_k$ matrix. The curve was obtained from low-rate charge/discharge data and fitted so that the derivative remains smooth — a noisy derivative directly corrupts the Kalman gain.
+Fraction of full scale corrupted:
 
-📷 *OCV–SoC curve:* `docs/ocv_soc_curve.png`
+$$\frac{1.88\ \text{V}}{3.3\ \text{V}} = 56.97\%$$
 
----
+Expressed in ADC counts:
 
-## 6. Filter Tuning (Q and R)
+$$0.5697 \times 4096 \approx 2333\ \text{counts}$$
 
-Plugging in the model is **not sufficient**. The filter only works once the covariances express an honest belief about uncertainty:
+More than half the usable input range was noise. No firmware filter or threshold adjustment can recover a signal degraded this badly — the problem had to be solved in hardware.
 
-- **Q** — process noise covariance: how much the model is distrusted (current-sensor bias, ECM simplification, ageing).
-- **R** — measurement noise covariance: how much the voltage sensor is distrusted.
-- **P₀** — initial state covariance: how wrong the initial SoC guess may be.
+📷 *Oscilloscope capture of pedal signal noise:* `docs/noise_capture.png`
 
-Practical intuition: a **large Q / small R** makes the filter chase the voltage measurement (fast convergence, noisy estimate); the reverse makes it lean on Coulomb counting (smooth, slow to recover from a wrong initial SoC). Tuning is the trade-off between these two failure modes.
+### Solution
 
----
+A **buffer stage** was inserted between the pedal sensors and the motor controller input. The buffer presents a high input impedance to the sensor and a low output impedance to the controller, isolating the microcontroller's sensing node from noise fed back along the motor controller line.
 
-## 7. Software-in-the-Loop Setup
+In the schematic this stage is marked by the **yellow block**. After implementation, noise-triggered faults no longer occurred during vehicle operation.
 
-```
-                ┌──────────────────────┐
-   Random       │  Batemo Battery      │  V_terminal (measured)
-   current ────▶│  Plant Model         │────────────┐
-   profile      └──────────────────────┘            │
-        │                                            ▼
-        │                                  ┌──────────────────┐
-        └─────────────────────────────────▶│  EKF Estimator   │──▶ SoC_est
-                                           │  (2-RC ECM)      │
-                                           └──────────────────┘
-                                                    │
-   SoC_plant ───────────────────────────────────────┴──▶ error ──▶ RMSE
-```
-
-The estimated SoC is compared **directly** against the plant's internal SoC, which is the advantage of SIL: ground truth is available, which is never the case on real hardware.
-
-📷 *Simulink SIL block diagram:* `docs/sil_diagram.png`
+📷 *System schematic (buffer stage highlighted):* `docs/schematic_overview.png`
 
 ---
 
-## 8. Test Profile and Results
+## 3. Problem 2 — Microcontroller Freezing
 
-Validation uses a **randomised dynamic current profile** — deliberately not a constant-current discharge, since the point of the EKF is to survive load transients.
+### Symptom
 
-Performance metric:
+The previous board, built around an **Arduino Nano (ATmega328P)**, would intermittently **freeze** during operation. On a safety-critical system an unresponsive controller is a worse failure mode than a false fault.
 
-$$RMSE = \sqrt{\frac{1}{N}\sum_{k=1}^{N}\left(SoC_{plant,k} - \hat{SoC}_k\right)^2}$$
+### Diagnosis
 
-📷 *Random current profile:* `docs/current_profile.png`
-📷 *SoC estimation vs. plant + error:* `docs/results_rmse.png`
+The freezes traced to **memory starvation**. The ATmega328P provides only 2 KB of SRAM. With the plausibility comparison, the Ready-To-Drive state machine, communication handling, and sensor acquisition all running concurrently, available RAM was exhausted and the controller stalled.
 
----
+### Solution
 
-## 9. Repository
-
-```
-SOC-ESTIMATION-BY-EKF/
-├── docs/          # figures used in this README
-├── data/          # HPPC and OCV datasets
-├── models/        # Simulink SIL model
-└── scripts/       # parameter extraction & post-processing
-```
-
-**Repository:** https://github.com/Fadhillahusein/SOC-ESTIMATION-BY-EKF
+Migration to the **ESP32**, which offers substantially more SRAM and a considerably higher clock frequency — enough headroom for all concurrent tasks with margin to spare.
 
 ---
 
-## 10. Known Limitations / Roadmap
+## 4. Validation Workflow
 
-- [ ] Parameters characterised at a single temperature — extend to a 2-D (SoC, T) look-up.
-- [ ] No hysteresis state in the model; NMC hysteresis is mild but not zero.
-- [ ] No ageing / capacity-fade adaptation — a **joint** or **dual** EKF could co-estimate $C_n$.
-- [ ] Move from SIL to Hardware-in-the-Loop, then to the embedded target.
+Rather than jumping straight to a manufactured board, the change was validated in three stages. Each stage was allowed to fail cheaply before committing to the next.
+
+### Stage 1 — Microcontroller swap test
+
+The existing Arduino Nano pinout was remapped to an ESP32 development board and dropped into the existing circuit. The question at this stage was deliberately narrow: **can the ESP32 fulfil the same role at all?**
+
+It was then taken to **vehicle testing** for validation under real operating conditions — because bench behaviour and on-car behaviour are not the same thing once inverter noise is involved. All functions performed correctly.
+
+📷 *Microcontroller swap test:* `docs/mcu_swap_test.png`
+
+### Stage 2 — Prototype PCB
+
+Once every sub-circuit met its requirement individually, the design was committed to a **prototyping PCB**. This stage exists to allow physical rework: if a circuit misbehaves, it can be cut, patched, and retested on the same board.
+
+Only after this revision cycle produced a design with no outstanding issues was the layout considered settled.
+
+📷 *Prototype PCB:* `docs/prototype_pcb.png`
+
+### Stage 3 — Final PCB
+
+The validated design was manufactured through **JLCPCB** as the final production board.
+
+---
+
+## 5. Design Principles Applied
+
+| Principle | Where it appears |
+|---|---|
+| Fix noise in hardware, not in software thresholds | Buffer stage, Problem 1 |
+| Measure before redesigning | Oscilloscope capture preceded the buffer decision |
+| Size the controller for the worst case, not the average | ESP32 migration, Problem 2 |
+| Validate on the vehicle, not only on the bench | Stage 1 |
+| Let the cheap board fail first | Prototype PCB before JLCPCB |
+
+---
+
+## 6. Hardware Summary
+
+- **Microcontroller:** ESP32
+- **Pedal sensing:** dual APPS with continuous plausibility comparison
+- **Signal conditioning:** buffer stage isolating the sensor node from the motor controller input
+- **Manufacturing:** JLCPCB
+- **Application:** FSAE electric race vehicle, Anargya ITS EV Team
+
+---
+
+## 7. Availability of Design Files
+
+Full schematics, board layout, and firmware source are **team-restricted** and not published in this repository. What is documented here is design reasoning and validation methodology.
+
+For access to detailed design files, please get in touch.
 
 ---
 
 ## References
 
-1. Ospina Agudelo, B. et al. *Advancing state estimation for lithium-ion batteries with hysteresis through systematic extended Kalman filter tuning.* **Scientific Reports**, 2024. https://www.nature.com/articles/s41598-024-61596-0
-2. Tran, M.-K. et al. *Comparative Study of Equivalent Circuit Models Performance in Four Common Lithium-Ion Batteries: LFP, NMC, LMO, NCA.* **Batteries** 7(3):51, 2021. https://www.mdpi.com/2313-0105/7/3/51
-3. Plett, G. L. *Battery Management Systems, Volume II: Equivalent-Circuit Methods.* Artech House, 2015. — the standard reference for ECM-based EKF SoC estimation.
-4. Batemo Cell Library — plant model source. https://www.batemo.com/products/batemo-cell-library/
-5. Idaho National Laboratory. *Battery Test Manual for Electric Vehicles (Rev. 3)*, 2015 — the origin of the HPPC procedure. https://inldigitallibrary.inl.gov/sites/sti/sti/6492291.pdf
+1. **SAE International — Formula SAE Rules** (APPS plausibility and EV safety requirements): https://www.fsaeonline.com/page.aspx?pageid=c4c5195a-60c0-46aa-acbf-2958ef545b72
+2. **Formula Student Germany Rules** — accelerator pedal position sensor and plausibility device requirements: https://www.formulastudent.de/fsg/rules/
+3. Espressif Systems — *ESP32 Technical Reference Manual*: https://www.espressif.com/sites/default/files/documentation/esp32_technical_reference_manual_en.pdf
+4. Espressif — *ADC calibration and noise considerations* (ESP-IDF documentation): https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/adc_calibration.html
+5. Microchip — *ATmega328P Datasheet* (2 KB SRAM specification): https://ww1.microchip.com/downloads/en/DeviceDoc/Atmel-7810-Automotive-Microcontrollers-ATmega328P_Datasheet.pdf
+6. Texas Instruments — *Op Amps for Everyone* (buffer and impedance-matching stages): https://www.ti.com/lit/an/slod006b/slod006b.pdf
+7. Henry W. Ott — *Electromagnetic Compatibility Engineering*, Wiley, 2009 — standard reference for coupled noise in mixed-signal systems.
